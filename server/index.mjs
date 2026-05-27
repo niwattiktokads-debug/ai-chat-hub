@@ -1,0 +1,395 @@
+import { createServer } from 'node:http'
+import { randomUUID } from 'node:crypto'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const PORT = Number(process.env.PORT || 8788)
+const HOST = process.env.HOST || '127.0.0.1'
+const DATA_PATH = process.env.CHAT_HUB_DATA_PATH || fileURLToPath(new URL('../data/runtime-state.json', import.meta.url))
+
+const conversations = [
+  {
+    id: 'conv_1024',
+    customer: 'Nicha R.',
+    channel: 'facebook',
+    page: 'MAN KYND',
+    status: 'draft_ready',
+    risk: 'low',
+    reviewScore: 9,
+    lastMessage: 'มีไซซ์ M สีดำไหมคะ',
+    latencyMs: 820,
+    draft: 'มีค่ะ เดี๋ยวแอดมินเช็กสต็อกสีดำไซซ์ M ให้ก่อนนะคะ ถ้าพร้อมส่งจะแจ้งยืนยันอีกครั้งค่ะ',
+    review: {
+      score: 9,
+      risk: 'low',
+      reasoning: 'คำตอบสุภาพและไม่ยืนยันข้อมูลสต็อกเกินกว่าที่ระบบรู้',
+      suggestion: 'ส่งได้หลังเช็กสต็อกจาก source จริง',
+    },
+    messages: [
+      { id: 'm1', author: 'Nicha R.', direction: 'customer', text: 'มีไซซ์ M สีดำไหมคะ', at: '10:42' },
+      { id: 'm2', author: 'Responder AI', direction: 'ai', text: 'มีค่ะ เดี๋ยวแอดมินเช็กสต็อกสีดำไซซ์ M ให้ก่อนนะคะ ถ้าพร้อมส่งจะแจ้งยืนยันอีกครั้งค่ะ', at: '10:42' },
+      { id: 'm3', author: 'Reviewer AI', direction: 'reviewer', text: 'Score 9, risk low. ไม่เดาราคา ไม่ยืนยันเกินข้อมูล', at: '10:43' },
+    ],
+  },
+  {
+    id: 'conv_1025',
+    customer: 'May S.',
+    channel: 'facebook',
+    page: 'Anna Lynn',
+    status: 'needs_human',
+    risk: 'medium',
+    reviewScore: 6,
+    lastMessage: 'ลดได้อีกไหม โอนเลยวันนี้',
+    latencyMs: 1440,
+    draft: 'ขอบคุณค่ะ เดี๋ยวให้พนักงานเช็กโปรและส่วนลดที่ใช้ได้ให้ก่อนนะคะ',
+    review: {
+      score: 6,
+      risk: 'medium',
+      reasoning: 'มีความเสี่ยงเรื่องส่วนลดและโปรโมชัน ต้องใช้ข้อมูลจากพนักงานก่อน',
+      suggestion: 'handoff ให้คนตรวจโปรก่อนตอบจริง',
+    },
+    messages: [
+      { id: 'm4', author: 'May S.', direction: 'customer', text: 'ลดได้อีกไหม โอนเลยวันนี้', at: '10:39' },
+      { id: 'm5', author: 'Responder AI', direction: 'ai', text: 'ขอบคุณค่ะ เดี๋ยวให้พนักงานเช็กโปรและส่วนลดที่ใช้ได้ให้ก่อนนะคะ', at: '10:40' },
+      { id: 'm6', author: 'Reviewer AI', direction: 'reviewer', text: 'Score 6, risk medium. ห้ามแต่งโปรเอง', at: '10:40' },
+    ],
+  },
+  {
+    id: 'conv_1026',
+    customer: 'Ploy Line',
+    channel: 'line',
+    page: 'LINE OA Main',
+    status: 'reviewing',
+    risk: 'high',
+    reviewScore: 4,
+    lastMessage: 'ขอยกเลิกแล้วคืนเงินค่ะ',
+    latencyMs: 2310,
+    draft: 'รับทราบค่ะ เรื่องยกเลิกและคืนเงินจะส่งให้พนักงานตรวจสอบรายละเอียดก่อนนะคะ',
+    review: {
+      score: 4,
+      risk: 'high',
+      reasoning: 'refund เป็นเคสเสี่ยงสูง ต้องตรวจ order, policy และยอดเงินก่อน',
+      suggestion: 'mark needs_human และห้าม auto-send',
+    },
+    messages: [
+      { id: 'm7', author: 'Ploy Line', direction: 'customer', text: 'ขอยกเลิกแล้วคืนเงินค่ะ', at: '10:37' },
+      { id: 'm8', author: 'Responder AI', direction: 'ai', text: 'รับทราบค่ะ เรื่องยกเลิกและคืนเงินจะส่งให้พนักงานตรวจสอบรายละเอียดก่อนนะคะ', at: '10:37' },
+    ],
+  },
+]
+
+const flowRuns = [
+  {
+    id: 'run_9001',
+    conversationId: 'conv_1024',
+    status: 'passed',
+    durationMs: 840,
+    createdAt: '10:43',
+    steps: [
+      { id: 's1', label: 'Customer message', status: 'ok', detail: 'Facebook message ingested' },
+      { id: 's2', label: 'Responder draft', status: 'ok', detail: 'Thai guarded reply generated' },
+      { id: 's3', label: 'Reviewer score', status: 'ok', detail: 'score 9, risk low' },
+      { id: 's4', label: 'Send/Handoff', status: 'ok', detail: 'ready for approval' },
+    ],
+  },
+]
+
+const channels = [
+  { id: 'ch_fb_mankynd', name: 'MAN KYND Messenger', channel: 'facebook', status: 'connected', token: 'EAAG...8xQ', url: 'https://chat.o-agent.local/webhook/meta' },
+  { id: 'ch_line_main', name: 'LINE OA Main', channel: 'line', status: 'pending', token: 'U57a...d93', url: 'https://chat.o-agent.local/webhook/line' },
+]
+
+const knowledge = [
+  { id: 'ks_refund', title: 'Policy: refund handoff', status: 'needs_review', type: 'policy', content: 'Refund/cancel cases must be reviewed by a human before sending a customer reply.' },
+  { id: 'ks_sizing', title: 'Product: sizing answer', status: 'ready', type: 'faq', content: 'Ask for color and size before confirming stock or availability.' },
+  { id: 'ks_shipping', title: 'Shipping: tracking rules', status: 'ready', type: 'faq', content: 'Tracking and order status must be checked against the order source before replying.' },
+]
+
+const defaultGraph = {
+  nodes: [
+    { id: 'trigger', type: 'TriggerNode', config: { source: 'facebook' } },
+    { id: 'responder', type: 'ResponderNode', config: { model: 'o-agent-default', temperature: 0.2, use_knowledge: true } },
+    { id: 'reviewer', type: 'ReviewerNode', config: { score_threshold: 8 } },
+    { id: 'condition', type: 'ConditionNode', config: { logic: 'score >= threshold && risk == low' } },
+    { id: 'send', type: 'SendReplyNode', config: { test_mode_blocks_send: true } },
+    { id: 'handoff', type: 'HandoffNode', config: { status: 'needs_human' } },
+  ],
+  edges: [
+    ['trigger', 'responder'],
+    ['responder', 'reviewer'],
+    ['reviewer', 'condition'],
+    ['condition', 'send'],
+    ['condition', 'handoff'],
+  ],
+}
+
+const flows = [
+  {
+    id: 'flow_default_review',
+    name: 'Default Responder + Reviewer',
+    status: 'active',
+    channel: 'facebook',
+    version: 1,
+    graph: defaultGraph,
+    config: {
+      responderPrompt: 'คุณคือผู้ช่วยตอบลูกค้าของร้าน ตอบสุภาพ กระชับ ภาษาไทย ถ้าไม่รู้ให้บอกว่าจะให้พนักงานตรวจสอบ ห้ามแต่งราคา โปร หรือข้อมูลสินค้าเอง',
+      reviewerPrompt: 'คุณคือ QA ตรวจคำตอบ AI ก่อนส่งให้ลูกค้าจริง ให้คะแนน 1-10 ระบุ risk low/medium/high พร้อมเหตุผลและคำแนะนำ ถ้าเสี่ยงให้ handoff',
+      scoreThreshold: 8,
+    },
+    updatedAt: new Date().toISOString(),
+  },
+]
+
+const promptHistory = [
+  { id: 'ph_seed_1', flowId: 'flow_default_review', version: 1, field: 'responderPrompt', changedBy: 'seed', createdAt: nowLabel() },
+]
+
+function saveState() {
+  mkdirSync(dirname(DATA_PATH), { recursive: true })
+  writeFileSync(DATA_PATH, JSON.stringify({ conversations, flowRuns, channels, knowledge, flows, promptHistory }, null, 2))
+}
+
+function loadState() {
+  if (!existsSync(DATA_PATH)) return saveState()
+  const saved = JSON.parse(readFileSync(DATA_PATH, 'utf8'))
+  if (Array.isArray(saved.conversations)) conversations.splice(0, conversations.length, ...saved.conversations)
+  if (Array.isArray(saved.flowRuns)) flowRuns.splice(0, flowRuns.length, ...saved.flowRuns)
+  if (Array.isArray(saved.channels)) channels.splice(0, channels.length, ...saved.channels)
+  if (Array.isArray(saved.knowledge)) knowledge.splice(0, knowledge.length, ...saved.knowledge)
+  if (Array.isArray(saved.flows)) flows.splice(0, flows.length, ...saved.flows)
+  if (Array.isArray(saved.promptHistory)) promptHistory.splice(0, promptHistory.length, ...saved.promptHistory)
+}
+
+function nowLabel() {
+  return new Date().toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' })
+}
+
+function reviewText(text) {
+  const risky = /คืนเงิน|ยกเลิก|ลด|โปร|ราคา/i.test(text)
+  const high = /คืนเงิน|ยกเลิก/i.test(text)
+  return {
+    score: high ? 4 : risky ? 6 : 9,
+    risk: high ? 'high' : risky ? 'medium' : 'low',
+    reasoning: high
+      ? 'Refund/cancel ต้องตรวจข้อมูล order และนโยบายก่อนตอบจริง'
+      : risky
+        ? 'มีความเสี่ยงเรื่องราคา โปร หรือส่วนลด ต้องให้คนตรวจ'
+        : 'คำตอบอยู่ในกรอบ ปลอดภัย และไม่เดาข้อมูลสินค้า',
+    suggestion: high || risky ? 'handoff ให้พนักงานตรวจสอบก่อนส่ง' : 'ส่งได้หลังตรวจ source สั้น ๆ',
+  }
+}
+
+function runFlow(conversationId, text) {
+  const conversation = conversations.find((item) => item.id === conversationId)
+  if (!conversation) return null
+  const targetText = String(text || conversation.lastMessage || '')
+  const review = reviewText(targetText)
+  const passed = review.score >= 8 && review.risk === 'low'
+  const nextStatus = passed ? 'draft_ready' : 'needs_human'
+  conversation.review = review
+  conversation.reviewScore = review.score
+  conversation.risk = review.risk
+  conversation.status = nextStatus
+  conversation.messages = [
+    ...conversation.messages,
+    { id: `review_${Date.now()}`, author: 'Reviewer AI', direction: 'reviewer', text: `Score ${review.score}, risk ${review.risk}. ${review.reasoning}`, at: nowLabel() },
+  ]
+  const run = {
+    id: `run_${Date.now()}`,
+    conversationId,
+    status: passed ? 'passed' : 'blocked',
+    durationMs: passed ? 780 : review.risk === 'high' ? 1640 : 1190,
+    createdAt: nowLabel(),
+    steps: [
+      { id: 'customer', label: 'Customer message', status: 'ok', detail: targetText },
+      { id: 'responder', label: 'Responder draft', status: 'ok', detail: conversation.draft },
+      { id: 'reviewer', label: 'Reviewer score', status: passed ? 'ok' : 'blocked', detail: `score ${review.score}, risk ${review.risk}` },
+      { id: 'handoff', label: 'Send/Handoff', status: passed ? 'ok' : 'blocked', detail: passed ? 'ready for approval' : 'needs human review' },
+    ],
+  }
+  flowRuns.unshift(run)
+  saveState()
+  return { conversation, run }
+}
+
+function applySuggestion(conversationId) {
+  const conversation = conversations.find((item) => item.id === conversationId)
+  if (!conversation) return null
+  const suggestion = conversation.review?.suggestion || 'ส่งให้พนักงานตรวจสอบก่อนตอบจริง'
+  conversation.draft = `${conversation.draft}\n\nหมายเหตุภายใน: ${suggestion}`
+  conversation.status = 'needs_human'
+  conversation.messages = [
+    ...conversation.messages,
+    { id: `apply_${Date.now()}`, author: 'System', direction: 'system', text: `Applied reviewer suggestion: ${suggestion}`, at: nowLabel() },
+  ]
+  saveState()
+  return conversation
+}
+
+function saveFlowConfig(flowId, input = {}) {
+  const flow = flows.find((item) => item.id === flowId)
+  if (!flow) return null
+  const before = JSON.stringify(flow.config)
+  flow.config = {
+    ...flow.config,
+    responderPrompt: String(input.responderPrompt || flow.config.responderPrompt),
+    reviewerPrompt: String(input.reviewerPrompt || flow.config.reviewerPrompt),
+    scoreThreshold: Number(input.scoreThreshold || flow.config.scoreThreshold || 8),
+  }
+  if (input.graph && typeof input.graph === 'object') flow.graph = input.graph
+  flow.version = Number(flow.version || 1) + 1
+  flow.updatedAt = new Date().toISOString()
+  if (JSON.stringify(flow.config) !== before) {
+    promptHistory.unshift({
+      id: `ph_${Date.now()}`,
+      flowId,
+      version: flow.version,
+      field: 'flowConfig',
+      changedBy: String(input.changedBy || 'boss'),
+      createdAt: nowLabel(),
+    })
+  }
+  saveState()
+  return flow
+}
+
+function addChannel(input = {}) {
+  const channel = {
+    id: `ch_${randomUUID().slice(0, 8)}`,
+    name: String(input.name || 'New Channel'),
+    channel: input.channel === 'line' ? 'line' : 'facebook',
+    status: 'pending',
+    token: 'masked...new',
+    url: String(input.url || (input.channel === 'line' ? 'https://chat.o-agent.local/webhook/line' : 'https://chat.o-agent.local/webhook/meta')),
+  }
+  channels.unshift(channel)
+  saveState()
+  return channel
+}
+
+function ingestWebhook({ channel, body }) {
+  const id = `conv_${randomUUID().slice(0, 8)}`
+  const text = String(body.text || (channel === 'line' ? 'ลูกค้าทดสอบจาก LINE webhook' : 'ลูกค้าทดสอบจาก Facebook webhook'))
+  const conversation = {
+    id,
+    customer: String(body.customer || (channel === 'line' ? 'LINE Customer' : 'Facebook Customer')),
+    channel,
+    page: String(body.page || (channel === 'line' ? 'LINE OA Main' : 'MAN KYND')),
+    status: 'reviewing',
+    risk: 'medium',
+    reviewScore: 0,
+    lastMessage: text,
+    latencyMs: 0,
+    draft: 'รับทราบค่ะ เดี๋ยวให้พนักงานตรวจสอบรายละเอียดก่อนตอบกลับนะคะ',
+    review: { score: 0, risk: 'medium', reasoning: 'pending reviewer', suggestion: 'run AI review' },
+    messages: [{ id: `msg_${Date.now()}`, author: String(body.customer || 'Customer'), direction: 'customer', text, at: nowLabel() }],
+  }
+  conversations.unshift(conversation)
+  saveState()
+  return conversation
+}
+
+function dashboard() {
+  const blocked = conversations.filter((item) => item.status === 'needs_human' || item.risk !== 'low').length
+  return {
+    today: conversations.length,
+    channels: new Set(conversations.map((item) => item.channel)).size,
+    avgScore: Math.round(conversations.reduce((sum, item) => sum + item.reviewScore, 0) / conversations.length),
+    blocked,
+    avgLatency: Math.round(conversations.reduce((sum, item) => sum + item.latencyMs, 0) / conversations.length),
+  }
+}
+
+async function readJson(req) {
+  const chunks = []
+  for await (const chunk of req) chunks.push(chunk)
+  const text = Buffer.concat(chunks).toString('utf8')
+  if (!text) return {}
+  return JSON.parse(text)
+}
+
+function send(res, status, body) {
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET,POST,OPTIONS',
+    'access-control-allow-headers': 'content-type,x-hub-signature-256',
+  })
+  res.end(JSON.stringify(body))
+}
+
+loadState()
+
+createServer(async (req, res) => {
+  const url = new URL(req.url || '/', `http://${req.headers.host}`)
+  if (req.method === 'OPTIONS') return send(res, 204, {})
+  if (req.method === 'GET' && url.pathname === '/api/health') return send(res, 200, { ok: true })
+  if (req.method === 'GET' && url.pathname === '/api/chat-hub/state') return send(res, 200, { ok: true, conversations, runs: flowRuns, channels, knowledge, flows, promptHistory, dashboard: dashboard() })
+  if (req.method === 'GET' && url.pathname === '/api/chat-hub/dashboard') return send(res, 200, { ok: true, dashboard: dashboard() })
+  if (req.method === 'GET' && url.pathname === '/api/chat-hub/conversations') return send(res, 200, { ok: true, conversations })
+  if (req.method === 'GET' && url.pathname === '/api/chat-hub/flow-runs') return send(res, 200, { ok: true, runs: flowRuns })
+  if (req.method === 'GET' && url.pathname === '/api/chat-hub/channels') return send(res, 200, { ok: true, channels })
+  if (req.method === 'GET' && url.pathname === '/api/chat-hub/knowledge') return send(res, 200, { ok: true, knowledge })
+  if (req.method === 'GET' && url.pathname === '/api/chat-hub/flows') return send(res, 200, { ok: true, flows, promptHistory })
+
+  if (req.method === 'POST' && url.pathname === '/api/chat-hub/channels') {
+    const body = await readJson(req)
+    const channel = addChannel(body)
+    return send(res, 200, { ok: true, channel, channels })
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/chat-hub/knowledge') {
+    const body = await readJson(req)
+    const item = {
+      id: `ks_${randomUUID().slice(0, 8)}`,
+      title: String(body.title || 'Untitled knowledge'),
+      status: body.status === 'ready' ? 'ready' : 'needs_review',
+      type: String(body.type || 'manual'),
+      content: String(body.content || ''),
+    }
+    knowledge.unshift(item)
+    saveState()
+    return send(res, 200, { ok: true, item, knowledge })
+  }
+
+  const flowSaveMatch = url.pathname.match(/^\/api\/chat-hub\/flows\/([^/]+)$/)
+  if (req.method === 'POST' && flowSaveMatch) {
+    const body = await readJson(req)
+    const flow = saveFlowConfig(flowSaveMatch[1], body)
+    if (!flow) return send(res, 404, { ok: false, error: 'flow_not_found' })
+    return send(res, 200, { ok: true, flow, flows, promptHistory })
+  }
+
+  const runMatch = url.pathname.match(/^\/api\/chat-hub\/conversations\/([^/]+)\/run-flow$/)
+  if (req.method === 'POST' && runMatch) {
+    const body = await readJson(req)
+    const result = runFlow(runMatch[1], body.text)
+    if (!result) return send(res, 404, { ok: false, error: 'conversation_not_found' })
+    return send(res, 200, { ok: true, ...result, conversations, runs: flowRuns, dashboard: dashboard() })
+  }
+
+  const applyMatch = url.pathname.match(/^\/api\/chat-hub\/conversations\/([^/]+)\/apply-suggestion$/)
+  if (req.method === 'POST' && applyMatch) {
+    const conversation = applySuggestion(applyMatch[1])
+    if (!conversation) return send(res, 404, { ok: false, error: 'conversation_not_found' })
+    return send(res, 200, { ok: true, conversation, conversations })
+  }
+
+  if (req.method === 'POST' && url.pathname === '/webhook/facebook/mock') {
+    const body = await readJson(req)
+    const conversation = ingestWebhook({ channel: 'facebook', body })
+    return send(res, 200, { ok: true, conversation, conversations, runs: flowRuns, dashboard: dashboard(), signatureVerified: false, testMode: true })
+  }
+
+  if (req.method === 'POST' && url.pathname === '/webhook/line/mock') {
+    const body = await readJson(req)
+    const conversation = ingestWebhook({ channel: 'line', body })
+    return send(res, 200, { ok: true, conversation, conversations, runs: flowRuns, dashboard: dashboard(), signatureVerified: false, testMode: true })
+  }
+
+  send(res, 404, { ok: false, error: 'not_found' })
+}).listen(PORT, HOST, () => {
+  console.log(`AI Chat Hub API listening on http://${HOST}:${PORT}`)
+  console.log(`State file: ${DATA_PATH}`)
+})

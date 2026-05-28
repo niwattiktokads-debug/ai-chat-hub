@@ -1,10 +1,15 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
+  addEdge,
   Background,
+  type Connection,
   Controls,
+  MarkerType,
   ReactFlow,
   type Edge,
   type Node,
+  useEdgesState,
+  useNodesState,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import {
@@ -106,13 +111,25 @@ type FlowConfig = {
   scoreThreshold: number
 }
 
+type FlowGraphNode = {
+  id: string
+  type: string
+  config: Record<string, string | number | boolean>
+  position?: { x: number; y: number }
+}
+
+type FlowGraph = {
+  nodes: FlowGraphNode[]
+  edges: Array<[string, string] | { id?: string; source: string; target: string; label?: string }>
+}
+
 type FlowDefinition = {
   id: string
   name: string
   status: 'active' | 'inactive' | 'draft'
   channel: Channel | 'manual'
   version: number
-  graph: unknown
+  graph: FlowGraph | Record<string, never>
   config: FlowConfig
   updatedAt: string
 }
@@ -289,7 +306,7 @@ async function postApplySuggestion(conversationId: string): Promise<{ conversati
   return body
 }
 
-async function postFlowConfig(flowId: string, config: FlowConfig): Promise<{ flows: FlowDefinition[]; flow: FlowDefinition; promptHistory: PromptHistoryItem[] }> {
+async function postFlowConfig(flowId: string, config: FlowConfig & { graph?: FlowGraph }): Promise<{ flows: FlowDefinition[]; flow: FlowDefinition; promptHistory: PromptHistoryItem[] }> {
   const response = await fetch(`${API_BASE}/api/chat-hub/flows/${encodeURIComponent(flowId)}`, {
     method: 'POST',
     headers: jsonHeaders(),
@@ -343,22 +360,90 @@ const nav = [
 
 type Route = (typeof nav)[number]['id']
 
-const flowNodes: Node[] = [
-  { id: 'trigger', position: { x: 0, y: 88 }, data: { label: 'Trigger\nfacebook | line | manual' }, type: 'input' },
-  { id: 'responder', position: { x: 230, y: 48 }, data: { label: 'Responder AI\nreply draft' } },
-  { id: 'reviewer', position: { x: 470, y: 48 }, data: { label: 'Reviewer AI\nscore + risk JSON' } },
-  { id: 'condition', position: { x: 710, y: 88 }, data: { label: 'Condition\nscore >= threshold' } },
-  { id: 'send', position: { x: 950, y: 10 }, data: { label: 'Send Reply\nguarded' }, type: 'output' },
-  { id: 'handoff', position: { x: 950, y: 165 }, data: { label: 'Handoff\nneeds human' }, type: 'output' },
+const nodeCatalog: FlowGraphNode[] = [
+  { id: 'trigger', type: 'TriggerNode', position: { x: 0, y: 88 }, config: { source: 'facebook' } },
+  { id: 'responder', type: 'ResponderNode', position: { x: 230, y: 48 }, config: { model: 'o-agent-default', temperature: 0.2, use_knowledge: true } },
+  { id: 'reviewer', type: 'ReviewerNode', position: { x: 470, y: 48 }, config: { score_threshold: 8 } },
+  { id: 'condition', type: 'ConditionNode', position: { x: 710, y: 88 }, config: { logic: 'score >= threshold && risk == low' } },
+  { id: 'send', type: 'SendReplyNode', position: { x: 950, y: 10 }, config: { test_mode_blocks_send: true } },
+  { id: 'handoff', type: 'HandoffNode', position: { x: 950, y: 165 }, config: { status: 'needs_human' } },
 ]
 
-const flowEdges: Edge[] = [
-  { id: 'e1', source: 'trigger', target: 'responder' },
-  { id: 'e2', source: 'responder', target: 'reviewer' },
-  { id: 'e3', source: 'reviewer', target: 'condition' },
-  { id: 'e4', source: 'condition', target: 'send', label: 'pass' },
-  { id: 'e5', source: 'condition', target: 'handoff', label: 'fail' },
-]
+const defaultGraph: FlowGraph = {
+  nodes: nodeCatalog,
+  edges: [
+    ['trigger', 'responder'],
+    ['responder', 'reviewer'],
+    ['reviewer', 'condition'],
+    { source: 'condition', target: 'send', label: 'pass' },
+    { source: 'condition', target: 'handoff', label: 'fail' },
+  ],
+}
+
+function isFlowGraph(graph: FlowDefinition['graph']): graph is FlowGraph {
+  return Boolean(graph && Array.isArray((graph as FlowGraph).nodes) && Array.isArray((graph as FlowGraph).edges))
+}
+
+function nodeTitle(type: string) {
+  return type.replace('Node', '').replace(/([a-z])([A-Z])/g, '$1 $2')
+}
+
+function nodeSubtitle(node: FlowGraphNode) {
+  if (node.type === 'TriggerNode') return String(node.config.source || 'manual')
+  if (node.type === 'ResponderNode') return `${node.config.model || 'model'} · temp ${node.config.temperature ?? 0.2}`
+  if (node.type === 'ReviewerNode') return `threshold ${node.config.score_threshold ?? 8}`
+  if (node.type === 'ConditionNode') return String(node.config.logic || 'pass/fail')
+  if (node.type === 'SendReplyNode') return 'guarded send'
+  return String(node.config.status || 'needs_human')
+}
+
+function graphToNodes(graph: FlowDefinition['graph']): Node[] {
+  const source = isFlowGraph(graph) ? graph : defaultGraph
+  return source.nodes.map((node, index) => ({
+    id: node.id,
+    type: node.type === 'TriggerNode' ? 'input' : node.type === 'SendReplyNode' || node.type === 'HandoffNode' ? 'output' : 'default',
+    position: node.position || { x: 160 * index, y: 120 },
+    data: {
+      graphType: node.type,
+      config: node.config,
+      label: (
+        <div className="min-w-36">
+          <div className="text-sm font-black text-slate-950">{nodeTitle(node.type)}</div>
+          <div className="mt-1 text-[11px] font-bold text-slate-500">{nodeSubtitle(node)}</div>
+        </div>
+      ),
+    },
+    className: 'rounded-xl border border-slate-300 bg-white px-3 py-2 shadow-sm',
+  }))
+}
+
+function graphToEdges(graph: FlowDefinition['graph']): Edge[] {
+  const source = isFlowGraph(graph) ? graph : defaultGraph
+  return source.edges.map((edge) => {
+    const sourceId = Array.isArray(edge) ? edge[0] : edge.source
+    const targetId = Array.isArray(edge) ? edge[1] : edge.target
+    return {
+      id: Array.isArray(edge) ? `edge_${sourceId}_${targetId}` : edge.id || `edge_${sourceId}_${targetId}`,
+      source: sourceId,
+      target: targetId,
+      label: Array.isArray(edge) ? undefined : edge.label,
+      markerEnd: { type: MarkerType.ArrowClosed },
+      style: { stroke: '#0b63f6', strokeWidth: 2 },
+    } satisfies Edge
+  })
+}
+
+function nodesToGraph(nodes: Node[], edges: Edge[]): FlowGraph {
+  return {
+    nodes: nodes.map((node) => ({
+      id: node.id,
+      type: String(node.data.graphType || 'ResponderNode'),
+      position: node.position,
+      config: (node.data.config || {}) as Record<string, string | number | boolean>,
+    })),
+    edges: edges.map((edge) => ({ id: edge.id, source: edge.source, target: edge.target, label: typeof edge.label === 'string' ? edge.label : undefined })),
+  }
+}
 
 function App() {
   const [route, setRoute] = useState<Route>('dashboard')
@@ -375,6 +460,7 @@ function App() {
   const [knowledge, setKnowledge] = useState(initialKnowledge)
   const [flows, setFlows] = useState(initialFlows)
   const [promptHistory, setPromptHistory] = useState<PromptHistoryItem[]>([])
+  const [testResult, setTestResult] = useState<FlowRun | null>(null)
 
   const selected = conversations.find((item) => item.id === selectedId) || conversations[0]
   const filteredConversations = conversations.filter((item) => {
@@ -384,11 +470,12 @@ function App() {
   })
 
   const stats = useMemo(() => {
+    const count = conversations.length
     const blocked = conversations.filter((item) => item.status === 'needs_human' || item.risk !== 'low').length
-    const avgScore = Math.round(conversations.reduce((sum, item) => sum + item.reviewScore, 0) / conversations.length)
-    const avgLatency = Math.round(conversations.reduce((sum, item) => sum + item.latencyMs, 0) / conversations.length)
+    const avgScore = count ? Math.round(conversations.reduce((sum, item) => sum + item.reviewScore, 0) / count) : 0
+    const avgLatency = count ? Math.round(conversations.reduce((sum, item) => sum + item.latencyMs, 0) / count) : 0
     return {
-      today: conversations.length,
+      today: count,
       channels: new Set(conversations.map((item) => item.channel)).size,
       avgScore,
       blocked,
@@ -413,7 +500,7 @@ function App() {
       })
   }, [])
 
-  function runReviewFlow(text?: string) {
+  function runReviewFlow(text?: string, keepTestOpen = false) {
     setLoadingRun(true)
     const targetText = text || selected.lastMessage
     postRunFlow(selected.id, targetText)
@@ -421,10 +508,11 @@ function App() {
         setConversations(data.conversations)
         setRuns(data.runs)
         setSelectedId(data.conversation.id)
+        setTestResult(data.run)
         setRuntimeSource('api')
         setToast(data.run.status === 'passed' ? 'Reviewer passed. Reply is ready for approval.' : 'Reviewer blocked this reply. Handoff required.')
         setLoadingRun(false)
-        setTestOpen(false)
+        if (!keepTestOpen) setTestOpen(false)
       })
       .catch(() => window.setTimeout(() => {
       const risky = /คืนเงิน|ยกเลิก|ลด|โปร|ราคา/i.test(targetText)
@@ -457,9 +545,10 @@ function App() {
         item.id === selected.id ? { ...item, review, reviewScore: review.score, risk: review.risk, status: nextStatus } : item
       )))
       setRuns((current) => [run, ...current])
+      setTestResult(run)
       setToast(nextStatus === 'draft_ready' ? 'Reviewer passed. Reply is ready for approval.' : 'Reviewer blocked this reply. Handoff required.')
       setLoadingRun(false)
-      setTestOpen(false)
+      if (!keepTestOpen) setTestOpen(false)
       setRuntimeSource('demo')
     }, 650))
   }
@@ -475,7 +564,7 @@ function App() {
       .catch(() => setToast('Apply suggestion needs the local API server.'))
   }
 
-  function saveFlow(config: FlowConfig) {
+  function saveFlow(config: FlowConfig & { graph?: FlowGraph }) {
     const flow = flows[0]
     if (!flow) return
     postFlowConfig(flow.id, config)
@@ -612,14 +701,14 @@ function App() {
                 onApplySuggestion={applySuggestion}
               />
             )}
-            {route === 'flows' && <Flows flow={flows[0] || initialFlows[0]} history={promptHistory} onSave={saveFlow} onTest={() => setTestOpen(true)} />}
+            {route === 'flows' && <Flows key={`${(flows[0] || initialFlows[0]).id}-${(flows[0] || initialFlows[0]).version}`} flow={flows[0] || initialFlows[0]} history={promptHistory} onSave={saveFlow} onTest={() => { setTestResult(null); setTestOpen(true) }} />}
             {route === 'channels' && <Channels rows={channels} onAdd={addChannel} onMock={ingestMock} onCopy={() => setToast('Webhook URL copied. Token remains masked.')} />}
             {route === 'knowledge' && <Knowledge items={knowledge} onAdd={addKnowledge} />}
           </div>
         </main>
       </div>
 
-      {testOpen && <TestDialog loading={loadingRun} onClose={() => setTestOpen(false)} onRun={runReviewFlow} />}
+      {testOpen && <TestDialog loading={loadingRun} result={testResult} onClose={() => setTestOpen(false)} onRun={(text) => runReviewFlow(text, true)} />}
       {toast && <Toast message={toast} onClose={() => setToast('')} />}
     </div>
   )
@@ -781,26 +870,135 @@ function Conversations(props: {
   )
 }
 
-function Flows({ flow, history, onSave, onTest }: { flow: FlowDefinition; history: PromptHistoryItem[]; onSave: (config: FlowConfig) => void; onTest: () => void }) {
+function Flows({ flow, history, onSave, onTest }: { flow: FlowDefinition; history: PromptHistoryItem[]; onSave: (config: FlowConfig & { graph?: FlowGraph }) => void; onTest: () => void }) {
   const [responderPrompt, setResponderPrompt] = useState(flow.config.responderPrompt)
   const [reviewerPrompt, setReviewerPrompt] = useState(flow.config.reviewerPrompt)
   const [scoreThreshold, setScoreThreshold] = useState(flow.config.scoreThreshold)
+  const [nodes, setNodes, onNodesChange] = useNodesState(graphToNodes(flow.graph))
+  const [edges, setEdges, onEdgesChange] = useEdgesState(graphToEdges(flow.graph))
+  const [selectedNodeId, setSelectedNodeId] = useState(nodes[0]?.id || '')
+  const nodeIdCounter = useRef(nodes.length)
+  const selectedNode = nodes.find((node) => node.id === selectedNodeId) || nodes[0]
+
+  function addNode(template: FlowGraphNode) {
+    nodeIdCounter.current += 1
+    const id = `${template.type.replace('Node', '').toLowerCase()}_${nodeIdCounter.current}`
+    const node = graphToNodes({
+      nodes: [{ ...template, id, position: { x: 120 + nodes.length * 36, y: 120 + nodes.length * 24 } }],
+      edges: [],
+    })[0]
+    setNodes((current) => [...current, node])
+    setSelectedNodeId(id)
+  }
+
+  function updateSelectedConfig(key: string, value: string | number | boolean) {
+    if (!selectedNode) return
+    setNodes((current) => current.map((node) => {
+      if (node.id !== selectedNode.id) return node
+      const config = { ...((node.data.config || {}) as Record<string, string | number | boolean>), [key]: value }
+      const graphNode: FlowGraphNode = { id: node.id, type: String(node.data.graphType), position: node.position, config }
+      return graphToNodes({ nodes: [graphNode], edges: [] })[0]
+    }))
+  }
+
+  function removeSelectedNode() {
+    if (!selectedNode || selectedNode.id === 'trigger') return
+    setNodes((current) => current.filter((node) => node.id !== selectedNode.id))
+    setEdges((current) => current.filter((edge) => edge.source !== selectedNode.id && edge.target !== selectedNode.id))
+    setSelectedNodeId('trigger')
+  }
+
+  function saveGraph() {
+    onSave({ responderPrompt, reviewerPrompt, scoreThreshold, graph: nodesToGraph(nodes, edges) })
+  }
+
   return (
-    <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_390px]">
+    <div className="grid min-h-[calc(100vh-112px)] gap-5 xl:grid-cols-[220px_minmax(0,1fr)_390px]">
+      <Panel title="Node palette" action={<Badge tone="blue">{nodes.length} nodes</Badge>}>
+        <div className="space-y-2">
+          {nodeCatalog.map((node) => (
+            <button key={node.type} type="button" onClick={() => addNode(node)} className="flex w-full items-center justify-between rounded-lg border border-slate-200 bg-white p-3 text-left transition hover:border-sky-300 hover:bg-sky-50">
+              <div>
+                <div className="text-sm font-black">{nodeTitle(node.type)}</div>
+                <div className="mt-1 text-xs font-semibold text-slate-500">{nodeSubtitle(node)}</div>
+              </div>
+              <Plus size={16} className="text-sky-600" />
+            </button>
+          ))}
+        </div>
+        <div className="mt-4 rounded-lg bg-slate-50 p-3 text-xs font-bold leading-5 text-slate-500">
+          Click a node to inspect. Drag nodes on the canvas. Connect handles to change execution order.
+        </div>
+      </Panel>
       <Panel
         title={`${flow.name} · v${flow.version}`}
-        action={<button type="button" onClick={onTest} className="inline-flex h-9 items-center gap-2 rounded-lg bg-[#0b63f6] px-3 text-sm font-black text-white"><Send size={16} /> Test flow</button>}
+        action={(
+          <div className="flex flex-wrap gap-2">
+            <button type="button" onClick={onTest} className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-black text-slate-800"><Send size={16} /> Test</button>
+            <button type="button" onClick={saveGraph} className="inline-flex h-9 items-center gap-2 rounded-lg bg-[#0b63f6] px-3 text-sm font-black text-white"><GitBranch size={16} /> Save graph</button>
+          </div>
+        )}
       >
-        <div className="h-[560px] overflow-hidden rounded-xl border border-slate-200 bg-white">
-          <ReactFlow nodes={flowNodes} edges={flowEdges} fitView nodesDraggable={false}>
+        <div className="h-[640px] overflow-hidden rounded-xl border border-slate-200 bg-white bg-[radial-gradient(#cbd5e1_1px,transparent_1px)] [background-size:18px_18px]">
+          <ReactFlow
+            nodes={nodes}
+            edges={edges}
+            fitView
+            nodesDraggable
+            onNodesChange={onNodesChange}
+            onEdgesChange={onEdgesChange}
+            onConnect={(connection: Connection) => setEdges((current) => addEdge({ ...connection, markerEnd: { type: MarkerType.ArrowClosed }, style: { stroke: '#0b63f6', strokeWidth: 2 } }, current))}
+            onNodeClick={(_, node) => setSelectedNodeId(node.id)}
+          >
             <Background />
             <Controls />
           </ReactFlow>
         </div>
       </Panel>
       <div className="space-y-5">
-        <Panel title="Inspector">
+        <Panel title={selectedNode ? `Inspector · ${nodeTitle(String(selectedNode.data.graphType))}` : 'Inspector'}>
           <div className="space-y-4">
+            {selectedNode && (
+              <div className="rounded-lg border border-slate-200 bg-white p-3">
+                <div className="text-xs font-black uppercase text-slate-400">Selected node</div>
+                <div className="mt-1 font-black">{selectedNode.id}</div>
+                <div className="mt-1 text-sm font-semibold text-slate-500">{nodeSubtitle({ id: selectedNode.id, type: String(selectedNode.data.graphType), config: (selectedNode.data.config || {}) as Record<string, string | number | boolean> })}</div>
+              </div>
+            )}
+            {selectedNode?.data.graphType === 'TriggerNode' && (
+              <label className="grid gap-2 text-sm font-black text-slate-700">
+                Source
+                <select value={String(((selectedNode.data.config || {}) as Record<string, string>).source || 'facebook')} onChange={(event) => updateSelectedConfig('source', event.target.value)} className="h-10 rounded-lg border border-slate-200 bg-white px-3 text-sm font-semibold">
+                  <option value="facebook">facebook</option>
+                  <option value="line">line</option>
+                  <option value="manual">manual</option>
+                </select>
+              </label>
+            )}
+            {selectedNode?.data.graphType === 'ResponderNode' && (
+              <>
+                <label className="grid gap-2 text-sm font-black text-slate-700">
+                  Model
+                  <input value={String(((selectedNode.data.config || {}) as Record<string, string>).model || '')} onChange={(event) => updateSelectedConfig('model', event.target.value)} className="h-10 rounded-lg border border-slate-200 bg-white px-3 text-sm font-semibold outline-none focus:border-sky-400" />
+                </label>
+                <label className="grid gap-2 text-sm font-black text-slate-700">
+                  Temperature
+                  <input type="number" step="0.1" min={0} max={1} value={Number(((selectedNode.data.config || {}) as Record<string, number>).temperature ?? 0.2)} onChange={(event) => updateSelectedConfig('temperature', Number(event.target.value))} className="h-10 rounded-lg border border-slate-200 bg-white px-3 text-sm font-semibold outline-none focus:border-sky-400" />
+                </label>
+              </>
+            )}
+            {selectedNode?.data.graphType === 'ReviewerNode' && (
+              <label className="grid gap-2 text-sm font-black text-slate-700">
+                Node score threshold
+                <input type="number" min={1} max={10} value={Number(((selectedNode.data.config || {}) as Record<string, number>).score_threshold ?? scoreThreshold)} onChange={(event) => updateSelectedConfig('score_threshold', Number(event.target.value))} className="h-10 rounded-lg border border-slate-200 bg-white px-3 text-sm font-semibold outline-none focus:border-sky-400" />
+              </label>
+            )}
+            {selectedNode?.data.graphType === 'ConditionNode' && (
+              <label className="grid gap-2 text-sm font-black text-slate-700">
+                Logic
+                <input value={String(((selectedNode.data.config || {}) as Record<string, string>).logic || '')} onChange={(event) => updateSelectedConfig('logic', event.target.value)} className="h-10 rounded-lg border border-slate-200 bg-white px-3 text-sm font-semibold outline-none focus:border-sky-400" />
+              </label>
+            )}
             <label className="grid gap-2 text-sm font-black text-slate-700">
               Responder prompt
               <textarea value={responderPrompt} onChange={(event) => setResponderPrompt(event.target.value)} className="min-h-32 rounded-lg border border-slate-200 bg-white p-3 text-sm font-semibold leading-6 outline-none focus:border-sky-400" />
@@ -813,8 +1011,11 @@ function Flows({ flow, history, onSave, onTest }: { flow: FlowDefinition; histor
               Score threshold
               <input type="number" min={1} max={10} value={scoreThreshold} onChange={(event) => setScoreThreshold(Number(event.target.value))} className="h-10 rounded-lg border border-slate-200 bg-white px-3 text-sm font-semibold outline-none focus:border-sky-400" />
             </label>
-            <button type="button" onClick={() => onSave({ responderPrompt, reviewerPrompt, scoreThreshold })} className="inline-flex h-10 w-full items-center justify-center gap-2 rounded-lg bg-[#0b63f6] px-4 text-sm font-black text-white">
+            <button type="button" onClick={saveGraph} className="inline-flex h-10 w-full items-center justify-center gap-2 rounded-lg bg-[#0b63f6] px-4 text-sm font-black text-white">
               <GitBranch size={16} /> Save graph version
+            </button>
+            <button type="button" onClick={removeSelectedNode} disabled={!selectedNode || selectedNode.id === 'trigger'} className="inline-flex h-10 w-full items-center justify-center gap-2 rounded-lg border border-rose-200 bg-white px-4 text-sm font-black text-rose-700 disabled:cursor-not-allowed disabled:opacity-40">
+              <AlertTriangle size={16} /> Remove selected node
             </button>
           </div>
         </Panel>
@@ -880,19 +1081,41 @@ function Knowledge({ items, onAdd }: { items: KnowledgeItem[]; onAdd: () => void
   )
 }
 
-function TestDialog({ loading, onClose, onRun }: { loading: boolean; onClose: () => void; onRun: (text: string) => void }) {
+function TestDialog({ loading, result, onClose, onRun }: { loading: boolean; result: FlowRun | null; onClose: () => void; onRun: (text: string) => void }) {
   const [text, setText] = useState('มีสีดำพร้อมส่งไหมคะ')
   return (
     <div className="fixed inset-0 z-40 grid place-items-center bg-slate-950/55 p-4">
-      <div className="w-full max-w-xl rounded-2xl bg-white p-5 shadow-2xl">
+      <div className="w-full max-w-3xl rounded-2xl bg-white p-5 shadow-2xl">
         <div className="flex items-center justify-between">
           <div><h2 className="text-lg font-black">Test flow</h2><p className="mt-1 text-sm font-semibold text-slate-500">Test mode never sends a real customer reply.</p></div>
           <button type="button" onClick={onClose} className="rounded-lg border border-slate-200 px-3 py-2 text-sm font-black">Close</button>
         </div>
-        <textarea value={text} onChange={(event) => setText(event.target.value)} className="mt-4 min-h-32 w-full rounded-xl border border-slate-200 p-3 text-sm font-semibold outline-none focus:border-sky-400" />
-        <button type="button" onClick={() => onRun(text)} disabled={loading} className="mt-4 inline-flex h-10 items-center gap-2 rounded-lg bg-[#0b63f6] px-4 text-sm font-black text-white disabled:opacity-60">
-          {loading ? <Loader2 className="animate-spin" size={16} /> : <Workflow size={16} />} Run test
-        </button>
+        <div className="mt-4 grid gap-4 md:grid-cols-[minmax(0,1fr)_minmax(280px,.8fr)]">
+          <div>
+            <textarea value={text} onChange={(event) => setText(event.target.value)} className="min-h-36 w-full rounded-xl border border-slate-200 p-3 text-sm font-semibold outline-none focus:border-sky-400" />
+            <button type="button" onClick={() => onRun(text)} disabled={loading} className="mt-4 inline-flex h-10 items-center gap-2 rounded-lg bg-[#0b63f6] px-4 text-sm font-black text-white disabled:opacity-60">
+              {loading ? <Loader2 className="animate-spin" size={16} /> : <Workflow size={16} />} Run test
+            </button>
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+            <div className="flex items-center justify-between">
+              <div className="text-sm font-black uppercase text-slate-500">Step output</div>
+              {result && <Badge tone={result.status === 'passed' ? 'green' : 'red'}>{result.status}</Badge>}
+            </div>
+            <div className="mt-3 space-y-2">
+              {(result?.steps || []).map((step) => (
+                <div key={step.id} className="rounded-lg border border-slate-200 bg-white p-3">
+                  <div className="flex items-center gap-2">
+                    <div className={`h-2.5 w-2.5 rounded-full ${step.status === 'ok' ? 'bg-emerald-500' : 'bg-rose-500'}`} />
+                    <div className="text-sm font-black">{step.label}</div>
+                  </div>
+                  <div className="mt-1 text-xs font-semibold leading-5 text-slate-500">{step.detail}</div>
+                </div>
+              ))}
+              {!result && <div className="rounded-lg border border-dashed border-slate-300 p-4 text-sm font-semibold text-slate-500">Run a simulated message to inspect customer message, responder draft, reviewer score, and send/handoff gate.</div>}
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   )

@@ -227,8 +227,8 @@ const seedRuns: FlowRun[] = [
 ]
 
 const initialChannels: ChannelRow[] = [
-  { id: 'ch_fb_mankynd', name: 'MAN KYND Messenger', channel: 'facebook', status: 'connected', token: 'EAAG...8xQ', url: 'https://chat.o-agent.local/webhook/meta' },
-  { id: 'ch_line_main', name: 'LINE OA Main', channel: 'line', status: 'pending', token: 'U57a...d93', url: 'https://chat.o-agent.local/webhook/line' },
+  { id: 'ch_fb_mankynd', name: 'MAN KYND Messenger', channel: 'facebook', status: 'connected', token: 'secret_ref:facebook_page_token', url: 'https://chat.o-agent.local/webhook/facebook' },
+  { id: 'ch_line_main', name: 'LINE OA Main', channel: 'line', status: 'pending', token: 'secret_ref:line_channel_token', url: 'https://chat.o-agent.local/webhook/line' },
 ]
 
 const initialKnowledge: KnowledgeItem[] = [
@@ -255,6 +255,14 @@ const initialFlows: FlowDefinition[] = [
 ]
 
 const API_BASE = import.meta.env.VITE_CHAT_HUB_API_BASE || 'http://127.0.0.1:8788'
+const API_KEY = import.meta.env.VITE_CHAT_HUB_API_KEY || ''
+
+function jsonHeaders() {
+  return {
+    'content-type': 'application/json',
+    ...(API_KEY ? { 'x-chat-hub-api-key': API_KEY } : {}),
+  }
+}
 
 async function getRuntimeState(): Promise<{ conversations: Conversation[]; runs: FlowRun[]; channels: ChannelRow[]; knowledge: KnowledgeItem[]; flows: FlowDefinition[]; promptHistory: PromptHistoryItem[] }> {
   const response = await fetch(`${API_BASE}/api/chat-hub/state`)
@@ -266,7 +274,7 @@ async function getRuntimeState(): Promise<{ conversations: Conversation[]; runs:
 async function postRunFlow(conversationId: string, text: string): Promise<{ conversations: Conversation[]; runs: FlowRun[]; conversation: Conversation; run: FlowRun }> {
   const response = await fetch(`${API_BASE}/api/chat-hub/conversations/${encodeURIComponent(conversationId)}/run-flow`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: jsonHeaders(),
     body: JSON.stringify({ text }),
   })
   const body = await response.json()
@@ -275,7 +283,7 @@ async function postRunFlow(conversationId: string, text: string): Promise<{ conv
 }
 
 async function postApplySuggestion(conversationId: string): Promise<{ conversations: Conversation[]; conversation: Conversation }> {
-  const response = await fetch(`${API_BASE}/api/chat-hub/conversations/${encodeURIComponent(conversationId)}/apply-suggestion`, { method: 'POST' })
+  const response = await fetch(`${API_BASE}/api/chat-hub/conversations/${encodeURIComponent(conversationId)}/apply-suggestion`, { method: 'POST', headers: API_KEY ? { 'x-chat-hub-api-key': API_KEY } : undefined })
   const body = await response.json()
   if (!response.ok || !body.ok) throw new Error(body.error || 'apply_suggestion_failed')
   return body
@@ -284,7 +292,7 @@ async function postApplySuggestion(conversationId: string): Promise<{ conversati
 async function postFlowConfig(flowId: string, config: FlowConfig): Promise<{ flows: FlowDefinition[]; flow: FlowDefinition; promptHistory: PromptHistoryItem[] }> {
   const response = await fetch(`${API_BASE}/api/chat-hub/flows/${encodeURIComponent(flowId)}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: jsonHeaders(),
     body: JSON.stringify({ ...config, changedBy: 'boss' }),
   })
   const body = await response.json()
@@ -295,7 +303,7 @@ async function postFlowConfig(flowId: string, config: FlowConfig): Promise<{ flo
 async function postChannel(input: { name: string; channel: Channel }): Promise<{ channels: ChannelRow[] }> {
   const response = await fetch(`${API_BASE}/api/chat-hub/channels`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: jsonHeaders(),
     body: JSON.stringify(input),
   })
   const body = await response.json()
@@ -306,7 +314,7 @@ async function postChannel(input: { name: string; channel: Channel }): Promise<{
 async function postKnowledge(input: { title: string; content: string; type: string; status?: 'ready' | 'needs_review' }): Promise<{ knowledge: KnowledgeItem[] }> {
   const response = await fetch(`${API_BASE}/api/chat-hub/knowledge`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: jsonHeaders(),
     body: JSON.stringify(input),
   })
   const body = await response.json()

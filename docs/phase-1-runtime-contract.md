@@ -38,6 +38,9 @@ POST /api/chat-hub/channels
 POST /api/chat-hub/knowledge
 POST /api/chat-hub/flows/:id
 POST /api/chat-hub/conversations/:id/apply-suggestion
+POST /webhook/facebook
+POST /webhook/line
+POST /webhook/facebook/mock
 POST /webhook/line/mock
 ```
 
@@ -50,7 +53,10 @@ GET  /api/chat-hub/dashboard
 GET  /api/chat-hub/conversations
 GET  /api/chat-hub/flow-runs
 POST /api/chat-hub/conversations/:id/run-flow
+POST /api/chat-hub/conversations/:id/apply-suggestion
+POST /api/chat-hub/flows/:id
 POST /webhook/facebook/mock
+POST /webhook/line/mock
 ```
 
 Local API base:
@@ -81,7 +87,11 @@ customer_message -> responder_draft -> reviewer_score -> send_or_handoff
 - No token value is shown in UI.
 - No test mode sends a real reply.
 - Auto-send is blocked unless Reviewer score passes and risk is low.
-- Facebook webhook POST must verify signature before production.
+- CORS is restricted by `CHAT_HUB_ALLOWED_ORIGINS`; do not deploy with `*`.
+- Protected write endpoints require `x-chat-hub-api-key` when `CHAT_HUB_API_KEY` is configured.
+- Facebook webhook POST verifies `x-hub-signature-256` on `/webhook/facebook`.
+- LINE webhook POST verifies `x-line-signature` on `/webhook/line`.
+- Mock webhooks are local demo routes and can be disabled with `CHAT_HUB_ENABLE_MOCK_WEBHOOKS=false`.
 - LINE customer webhook is separate from existing LINE Suda group alert runtime.
 
 ## Production Path

@@ -8,6 +8,7 @@
     "dev:api": "node server/index.mjs",
     "dev:web": "vite",
     "start": "node server/index.mjs",
+    "test": "node --test server/*.test.mjs",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview"

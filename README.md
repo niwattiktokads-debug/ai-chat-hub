@@ -15,6 +15,7 @@ Premium AI operations command center for O-Agent customer chat.
 - Prompt history
 - LINE and Facebook webhook mock ingest
 - Apply reviewer suggestion to draft
+- CORS origin whitelist, optional API key guard, body size limit, and signed production webhook routes
 
 ## Run
 
@@ -48,9 +49,24 @@ curl -X POST http://127.0.0.1:8788/webhook/line/mock \
   -d '{"customer":"LINE Test","text":"ขอยกเลิกค่ะ"}'
 ```
 
+If `CHAT_HUB_API_KEY` is set, protected write endpoints require:
+
+```text
+x-chat-hub-api-key: <CHAT_HUB_API_KEY>
+```
+
+Production webhook routes are:
+
+```text
+POST /webhook/facebook  # verifies x-hub-signature-256 with FACEBOOK_APP_SECRET
+POST /webhook/line      # verifies x-line-signature with LINE_CHANNEL_SECRET
+```
+
 ## Verify
 
 ```bash
+npm test
+npm run lint
 npm run build
 ```
 

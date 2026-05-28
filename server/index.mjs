@@ -1,12 +1,22 @@
 import { createServer } from 'node:http'
-import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const PORT = Number(process.env.PORT || 8788)
 const HOST = process.env.HOST || '127.0.0.1'
 const DATA_PATH = process.env.CHAT_HUB_DATA_PATH || fileURLToPath(new URL('../data/runtime-state.json', import.meta.url))
+const MAX_BODY_BYTES = Number(process.env.CHAT_HUB_MAX_BODY_BYTES || 512 * 1024)
+const MAX_FLOW_RUNS = Number(process.env.CHAT_HUB_MAX_FLOW_RUNS || 200)
+const API_KEY = process.env.CHAT_HUB_API_KEY || ''
+const ENABLE_MOCK_WEBHOOKS = process.env.CHAT_HUB_ENABLE_MOCK_WEBHOOKS !== 'false'
+const ALLOWED_ORIGINS = new Set(
+  String(process.env.CHAT_HUB_ALLOWED_ORIGINS || 'http://127.0.0.1:5173,http://127.0.0.1:5174,http://localhost:5173,http://localhost:5174')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean),
+)
 
 const conversations = [
   {
@@ -96,8 +106,8 @@ const flowRuns = [
 ]
 
 const channels = [
-  { id: 'ch_fb_mankynd', name: 'MAN KYND Messenger', channel: 'facebook', status: 'connected', token: 'EAAG...8xQ', url: 'https://chat.o-agent.local/webhook/meta' },
-  { id: 'ch_line_main', name: 'LINE OA Main', channel: 'line', status: 'pending', token: 'U57a...d93', url: 'https://chat.o-agent.local/webhook/line' },
+  { id: 'ch_fb_mankynd', name: 'MAN KYND Messenger', channel: 'facebook', status: 'connected', token: 'secret_ref:facebook_page_token', url: 'https://chat.o-agent.local/webhook/facebook' },
+  { id: 'ch_line_main', name: 'LINE OA Main', channel: 'line', status: 'pending', token: 'secret_ref:line_channel_token', url: 'https://chat.o-agent.local/webhook/line' },
 ]
 
 const knowledge = [
@@ -147,18 +157,34 @@ const promptHistory = [
 
 function saveState() {
   mkdirSync(dirname(DATA_PATH), { recursive: true })
-  writeFileSync(DATA_PATH, JSON.stringify({ conversations, flowRuns, channels, knowledge, flows, promptHistory }, null, 2))
+  if (flowRuns.length > MAX_FLOW_RUNS) flowRuns.splice(MAX_FLOW_RUNS)
+  const tmpPath = `${DATA_PATH}.${process.pid}.${Date.now()}.tmp`
+  writeFileSync(tmpPath, JSON.stringify({ conversations, flowRuns, channels, knowledge, flows, promptHistory }, null, 2))
+  renameSync(tmpPath, DATA_PATH)
+}
+
+function sanitizeChannel(channel) {
+  const normalized = { ...channel }
+  if (!String(normalized.token || '').startsWith('secret_ref:')) {
+    normalized.token = `secret_ref:${normalized.channel || 'channel'}_token`
+  }
+  return normalized
 }
 
 function loadState() {
   if (!existsSync(DATA_PATH)) return saveState()
-  const saved = JSON.parse(readFileSync(DATA_PATH, 'utf8'))
-  if (Array.isArray(saved.conversations)) conversations.splice(0, conversations.length, ...saved.conversations)
-  if (Array.isArray(saved.flowRuns)) flowRuns.splice(0, flowRuns.length, ...saved.flowRuns)
-  if (Array.isArray(saved.channels)) channels.splice(0, channels.length, ...saved.channels)
-  if (Array.isArray(saved.knowledge)) knowledge.splice(0, knowledge.length, ...saved.knowledge)
-  if (Array.isArray(saved.flows)) flows.splice(0, flows.length, ...saved.flows)
-  if (Array.isArray(saved.promptHistory)) promptHistory.splice(0, promptHistory.length, ...saved.promptHistory)
+  try {
+    const saved = JSON.parse(readFileSync(DATA_PATH, 'utf8'))
+    if (Array.isArray(saved.conversations)) conversations.splice(0, conversations.length, ...saved.conversations)
+    if (Array.isArray(saved.flowRuns)) flowRuns.splice(0, flowRuns.length, ...saved.flowRuns.slice(0, MAX_FLOW_RUNS))
+    if (Array.isArray(saved.channels)) channels.splice(0, channels.length, ...saved.channels.map(sanitizeChannel))
+    if (Array.isArray(saved.knowledge)) knowledge.splice(0, knowledge.length, ...saved.knowledge)
+    if (Array.isArray(saved.flows)) flows.splice(0, flows.length, ...saved.flows)
+    if (Array.isArray(saved.promptHistory)) promptHistory.splice(0, promptHistory.length, ...saved.promptHistory)
+  } catch (error) {
+    console.error(`State file could not be loaded, using seed state: ${error.message}`)
+    return saveState()
+  }
 }
 
 function nowLabel() {
@@ -291,105 +317,201 @@ function ingestWebhook({ channel, body }) {
 }
 
 function dashboard() {
+  const count = conversations.length
   const blocked = conversations.filter((item) => item.status === 'needs_human' || item.risk !== 'low').length
   return {
-    today: conversations.length,
+    today: count,
     channels: new Set(conversations.map((item) => item.channel)).size,
-    avgScore: Math.round(conversations.reduce((sum, item) => sum + item.reviewScore, 0) / conversations.length),
+    avgScore: count ? Math.round(conversations.reduce((sum, item) => sum + item.reviewScore, 0) / count) : 0,
     blocked,
-    avgLatency: Math.round(conversations.reduce((sum, item) => sum + item.latencyMs, 0) / conversations.length),
+    avgLatency: count ? Math.round(conversations.reduce((sum, item) => sum + item.latencyMs, 0) / count) : 0,
   }
 }
 
 async function readJson(req) {
   const chunks = []
-  for await (const chunk of req) chunks.push(chunk)
+  let totalBytes = 0
+  for await (const chunk of req) {
+    totalBytes += chunk.length
+    if (totalBytes > MAX_BODY_BYTES) {
+      const error = new Error('request_body_too_large')
+      error.status = 413
+      throw error
+    }
+    chunks.push(chunk)
+  }
   const text = Buffer.concat(chunks).toString('utf8')
   if (!text) return {}
   return JSON.parse(text)
 }
 
-function send(res, status, body) {
-  res.writeHead(status, {
+function corsOrigin(req) {
+  const origin = req?.headers?.origin
+  if (!origin) return [...ALLOWED_ORIGINS][0] || 'http://127.0.0.1:5174'
+  return ALLOWED_ORIGINS.has(origin) ? origin : ''
+}
+
+function send(res, status, body, req) {
+  const origin = corsOrigin(req)
+  const headers = {
     'content-type': 'application/json; charset=utf-8',
-    'access-control-allow-origin': '*',
     'access-control-allow-methods': 'GET,POST,OPTIONS',
-    'access-control-allow-headers': 'content-type,x-hub-signature-256',
+    'access-control-allow-headers': 'content-type,x-chat-hub-api-key,x-hub-signature-256,x-line-signature',
+    vary: 'origin',
+  }
+  if (origin) headers['access-control-allow-origin'] = origin
+  res.writeHead(status, {
+    ...headers,
   })
   res.end(JSON.stringify(body))
 }
 
+function hasWriteAccess(req) {
+  if (!API_KEY) return true
+  return req.headers['x-chat-hub-api-key'] === API_KEY
+}
+
+function verifyHmacSignature({ algorithm, secret, signatureHeader, payload, prefix = '' }) {
+  if (!secret) return { ok: false, error: 'missing_webhook_secret' }
+  if (!signatureHeader) return { ok: false, error: 'missing_signature' }
+  const expected = `${prefix}${createHmac(algorithm, secret).update(payload).digest('hex')}`
+  const expectedBuffer = Buffer.from(expected)
+  const actualBuffer = Buffer.from(String(signatureHeader))
+  if (expectedBuffer.length !== actualBuffer.length) return { ok: false, error: 'invalid_signature' }
+  return timingSafeEqual(expectedBuffer, actualBuffer) ? { ok: true } : { ok: false, error: 'invalid_signature' }
+}
+
+async function readRawBody(req) {
+  const chunks = []
+  let totalBytes = 0
+  for await (const chunk of req) {
+    totalBytes += chunk.length
+    if (totalBytes > MAX_BODY_BYTES) {
+      const error = new Error('request_body_too_large')
+      error.status = 413
+      throw error
+    }
+    chunks.push(chunk)
+  }
+  return Buffer.concat(chunks)
+}
+
 loadState()
 
-createServer(async (req, res) => {
+const server = createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host}`)
-  if (req.method === 'OPTIONS') return send(res, 204, {})
-  if (req.method === 'GET' && url.pathname === '/api/health') return send(res, 200, { ok: true })
-  if (req.method === 'GET' && url.pathname === '/api/chat-hub/state') return send(res, 200, { ok: true, conversations, runs: flowRuns, channels, knowledge, flows, promptHistory, dashboard: dashboard() })
-  if (req.method === 'GET' && url.pathname === '/api/chat-hub/dashboard') return send(res, 200, { ok: true, dashboard: dashboard() })
-  if (req.method === 'GET' && url.pathname === '/api/chat-hub/conversations') return send(res, 200, { ok: true, conversations })
-  if (req.method === 'GET' && url.pathname === '/api/chat-hub/flow-runs') return send(res, 200, { ok: true, runs: flowRuns })
-  if (req.method === 'GET' && url.pathname === '/api/chat-hub/channels') return send(res, 200, { ok: true, channels })
-  if (req.method === 'GET' && url.pathname === '/api/chat-hub/knowledge') return send(res, 200, { ok: true, knowledge })
-  if (req.method === 'GET' && url.pathname === '/api/chat-hub/flows') return send(res, 200, { ok: true, flows, promptHistory })
+  try {
+    if (req.method === 'OPTIONS') return send(res, 204, {}, req)
+    if (req.method === 'GET' && url.pathname === '/api/health') return send(res, 200, { ok: true }, req)
+    if (req.method === 'GET' && url.pathname === '/api/chat-hub/state') return send(res, 200, { ok: true, conversations, runs: flowRuns, channels, knowledge, flows, promptHistory, dashboard: dashboard() }, req)
+    if (req.method === 'GET' && url.pathname === '/api/chat-hub/dashboard') return send(res, 200, { ok: true, dashboard: dashboard() }, req)
+    if (req.method === 'GET' && url.pathname === '/api/chat-hub/conversations') return send(res, 200, { ok: true, conversations }, req)
+    if (req.method === 'GET' && url.pathname === '/api/chat-hub/flow-runs') return send(res, 200, { ok: true, runs: flowRuns }, req)
+    if (req.method === 'GET' && url.pathname === '/api/chat-hub/channels') return send(res, 200, { ok: true, channels }, req)
+    if (req.method === 'GET' && url.pathname === '/api/chat-hub/knowledge') return send(res, 200, { ok: true, knowledge }, req)
+    if (req.method === 'GET' && url.pathname === '/api/chat-hub/flows') return send(res, 200, { ok: true, flows, promptHistory }, req)
 
-  if (req.method === 'POST' && url.pathname === '/api/chat-hub/channels') {
-    const body = await readJson(req)
-    const channel = addChannel(body)
-    return send(res, 200, { ok: true, channel, channels })
-  }
-
-  if (req.method === 'POST' && url.pathname === '/api/chat-hub/knowledge') {
-    const body = await readJson(req)
-    const item = {
-      id: `ks_${randomUUID().slice(0, 8)}`,
-      title: String(body.title || 'Untitled knowledge'),
-      status: body.status === 'ready' ? 'ready' : 'needs_review',
-      type: String(body.type || 'manual'),
-      content: String(body.content || ''),
+    if (req.method === 'POST' && url.pathname.startsWith('/api/chat-hub/') && !hasWriteAccess(req)) {
+      return send(res, 401, { ok: false, error: 'unauthorized' }, req)
     }
-    knowledge.unshift(item)
-    saveState()
-    return send(res, 200, { ok: true, item, knowledge })
-  }
 
-  const flowSaveMatch = url.pathname.match(/^\/api\/chat-hub\/flows\/([^/]+)$/)
-  if (req.method === 'POST' && flowSaveMatch) {
-    const body = await readJson(req)
-    const flow = saveFlowConfig(flowSaveMatch[1], body)
-    if (!flow) return send(res, 404, { ok: false, error: 'flow_not_found' })
-    return send(res, 200, { ok: true, flow, flows, promptHistory })
-  }
+    if (req.method === 'POST' && url.pathname === '/api/chat-hub/channels') {
+      const body = await readJson(req)
+      const channel = addChannel(body)
+      return send(res, 200, { ok: true, channel, channels }, req)
+    }
 
-  const runMatch = url.pathname.match(/^\/api\/chat-hub\/conversations\/([^/]+)\/run-flow$/)
-  if (req.method === 'POST' && runMatch) {
-    const body = await readJson(req)
-    const result = runFlow(runMatch[1], body.text)
-    if (!result) return send(res, 404, { ok: false, error: 'conversation_not_found' })
-    return send(res, 200, { ok: true, ...result, conversations, runs: flowRuns, dashboard: dashboard() })
-  }
+    if (req.method === 'POST' && url.pathname === '/api/chat-hub/knowledge') {
+      const body = await readJson(req)
+      const item = {
+        id: `ks_${randomUUID().slice(0, 8)}`,
+        title: String(body.title || 'Untitled knowledge'),
+        status: body.status === 'ready' ? 'ready' : 'needs_review',
+        type: String(body.type || 'manual'),
+        content: String(body.content || ''),
+      }
+      knowledge.unshift(item)
+      saveState()
+      return send(res, 200, { ok: true, item, knowledge }, req)
+    }
 
-  const applyMatch = url.pathname.match(/^\/api\/chat-hub\/conversations\/([^/]+)\/apply-suggestion$/)
-  if (req.method === 'POST' && applyMatch) {
-    const conversation = applySuggestion(applyMatch[1])
-    if (!conversation) return send(res, 404, { ok: false, error: 'conversation_not_found' })
-    return send(res, 200, { ok: true, conversation, conversations })
-  }
+    const flowSaveMatch = url.pathname.match(/^\/api\/chat-hub\/flows\/([^/]+)$/)
+    if (req.method === 'POST' && flowSaveMatch) {
+      const body = await readJson(req)
+      const flow = saveFlowConfig(flowSaveMatch[1], body)
+      if (!flow) return send(res, 404, { ok: false, error: 'flow_not_found' }, req)
+      return send(res, 200, { ok: true, flow, flows, promptHistory }, req)
+    }
 
-  if (req.method === 'POST' && url.pathname === '/webhook/facebook/mock') {
-    const body = await readJson(req)
-    const conversation = ingestWebhook({ channel: 'facebook', body })
-    return send(res, 200, { ok: true, conversation, conversations, runs: flowRuns, dashboard: dashboard(), signatureVerified: false, testMode: true })
-  }
+    const runMatch = url.pathname.match(/^\/api\/chat-hub\/conversations\/([^/]+)\/run-flow$/)
+    if (req.method === 'POST' && runMatch) {
+      const body = await readJson(req)
+      const result = runFlow(runMatch[1], body.text)
+      if (!result) return send(res, 404, { ok: false, error: 'conversation_not_found' }, req)
+      return send(res, 200, { ok: true, ...result, conversations, runs: flowRuns, dashboard: dashboard() }, req)
+    }
 
-  if (req.method === 'POST' && url.pathname === '/webhook/line/mock') {
-    const body = await readJson(req)
-    const conversation = ingestWebhook({ channel: 'line', body })
-    return send(res, 200, { ok: true, conversation, conversations, runs: flowRuns, dashboard: dashboard(), signatureVerified: false, testMode: true })
-  }
+    const applyMatch = url.pathname.match(/^\/api\/chat-hub\/conversations\/([^/]+)\/apply-suggestion$/)
+    if (req.method === 'POST' && applyMatch) {
+      const conversation = applySuggestion(applyMatch[1])
+      if (!conversation) return send(res, 404, { ok: false, error: 'conversation_not_found' }, req)
+      return send(res, 200, { ok: true, conversation, conversations }, req)
+    }
 
-  send(res, 404, { ok: false, error: 'not_found' })
-}).listen(PORT, HOST, () => {
-  console.log(`AI Chat Hub API listening on http://${HOST}:${PORT}`)
-  console.log(`State file: ${DATA_PATH}`)
+    if (req.method === 'POST' && url.pathname === '/webhook/facebook') {
+      const rawBody = await readRawBody(req)
+      const verification = verifyHmacSignature({
+        algorithm: 'sha256',
+        secret: process.env.FACEBOOK_APP_SECRET || '',
+        signatureHeader: req.headers['x-hub-signature-256'],
+        payload: rawBody,
+        prefix: 'sha256=',
+      })
+      if (!verification.ok) return send(res, 401, { ok: false, error: verification.error }, req)
+      const conversation = ingestWebhook({ channel: 'facebook', body: JSON.parse(rawBody.toString('utf8') || '{}') })
+      return send(res, 200, { ok: true, conversation, conversations, runs: flowRuns, dashboard: dashboard(), signatureVerified: true, testMode: false }, req)
+    }
+
+    if (req.method === 'POST' && url.pathname === '/webhook/line') {
+      const rawBody = await readRawBody(req)
+      const verification = verifyHmacSignature({
+        algorithm: 'sha256',
+        secret: process.env.LINE_CHANNEL_SECRET || '',
+        signatureHeader: req.headers['x-line-signature'],
+        payload: rawBody,
+        prefix: '',
+      })
+      if (!verification.ok) return send(res, 401, { ok: false, error: verification.error }, req)
+      const conversation = ingestWebhook({ channel: 'line', body: JSON.parse(rawBody.toString('utf8') || '{}') })
+      return send(res, 200, { ok: true, conversation, conversations, runs: flowRuns, dashboard: dashboard(), signatureVerified: true, testMode: false }, req)
+    }
+
+    if (req.method === 'POST' && url.pathname === '/webhook/facebook/mock') {
+      if (!ENABLE_MOCK_WEBHOOKS) return send(res, 404, { ok: false, error: 'mock_webhooks_disabled' }, req)
+      const body = await readJson(req)
+      const conversation = ingestWebhook({ channel: 'facebook', body })
+      return send(res, 200, { ok: true, conversation, conversations, runs: flowRuns, dashboard: dashboard(), signatureVerified: false, testMode: true }, req)
+    }
+
+    if (req.method === 'POST' && url.pathname === '/webhook/line/mock') {
+      if (!ENABLE_MOCK_WEBHOOKS) return send(res, 404, { ok: false, error: 'mock_webhooks_disabled' }, req)
+      const body = await readJson(req)
+      const conversation = ingestWebhook({ channel: 'line', body })
+      return send(res, 200, { ok: true, conversation, conversations, runs: flowRuns, dashboard: dashboard(), signatureVerified: false, testMode: true }, req)
+    }
+
+    send(res, 404, { ok: false, error: 'not_found' }, req)
+  } catch (error) {
+    send(res, error.status || 400, { ok: false, error: error.message || 'bad_request' }, req)
+  }
 })
+
+if (process.env.CHAT_HUB_DISABLE_LISTEN !== '1') {
+  server.listen(PORT, HOST, () => {
+    console.log(`AI Chat Hub API listening on http://${HOST}:${PORT}`)
+    console.log(`State file: ${DATA_PATH}`)
+    if (!API_KEY) console.warn('CHAT_HUB_API_KEY is not set; local write endpoints are not API-key protected.')
+  })
+}
+
+export { dashboard, reviewText, runFlow, server, verifyHmacSignature }

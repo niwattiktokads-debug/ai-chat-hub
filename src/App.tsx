@@ -1,10 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   addEdge,
   Background,
-  type Connection,
   Controls,
+  type DefaultEdgeOptions,
+  type FitViewOptions,
   MarkerType,
+  type OnConnect,
+  type OnNodeDrag,
   ReactFlow,
   type Edge,
   type Node,
@@ -380,6 +383,12 @@ const defaultGraph: FlowGraph = {
   ],
 }
 
+const flowFitViewOptions: FitViewOptions = { padding: 0.18 }
+const flowDefaultEdgeOptions: DefaultEdgeOptions = {
+  markerEnd: { type: MarkerType.ArrowClosed },
+  style: { stroke: '#0b63f6', strokeWidth: 2 },
+}
+
 function isFlowGraph(graph: FlowDefinition['graph']): graph is FlowGraph {
   return Boolean(graph && Array.isArray((graph as FlowGraph).nodes) && Array.isArray((graph as FlowGraph).edges))
 }
@@ -427,8 +436,7 @@ function graphToEdges(graph: FlowDefinition['graph']): Edge[] {
       source: sourceId,
       target: targetId,
       label: Array.isArray(edge) ? undefined : edge.label,
-      markerEnd: { type: MarkerType.ArrowClosed },
-      style: { stroke: '#0b63f6', strokeWidth: 2 },
+      ...flowDefaultEdgeOptions,
     } satisfies Edge
   })
 }
@@ -912,6 +920,14 @@ function Flows({ flow, history, onSave, onTest }: { flow: FlowDefinition; histor
     onSave({ responderPrompt, reviewerPrompt, scoreThreshold, graph: nodesToGraph(nodes, edges) })
   }
 
+  const onConnect: OnConnect = useCallback((connection) => {
+    setEdges((current) => addEdge(connection, current))
+  }, [setEdges])
+
+  const onNodeDrag: OnNodeDrag = useCallback((_, node) => {
+    setSelectedNodeId(node.id)
+  }, [])
+
   return (
     <div className="grid min-h-[calc(100vh-112px)] gap-5 xl:grid-cols-[220px_minmax(0,1fr)_390px]">
       <Panel title="Node palette" action={<Badge tone="blue">{nodes.length} nodes</Badge>}>
@@ -944,10 +960,13 @@ function Flows({ flow, history, onSave, onTest }: { flow: FlowDefinition; histor
             nodes={nodes}
             edges={edges}
             fitView
+            fitViewOptions={flowFitViewOptions}
+            defaultEdgeOptions={flowDefaultEdgeOptions}
             nodesDraggable
             onNodesChange={onNodesChange}
             onEdgesChange={onEdgesChange}
-            onConnect={(connection: Connection) => setEdges((current) => addEdge({ ...connection, markerEnd: { type: MarkerType.ArrowClosed }, style: { stroke: '#0b63f6', strokeWidth: 2 } }, current))}
+            onConnect={onConnect}
+            onNodeDrag={onNodeDrag}
             onNodeClick={(_, node) => setSelectedNodeId(node.id)}
           >
             <Background />
